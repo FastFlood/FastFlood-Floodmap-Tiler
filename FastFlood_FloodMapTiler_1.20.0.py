@@ -65,7 +65,7 @@ from rasterio.windows import Window
 # combination automatically. The value is also offered as the interactive
 # prompt default; users can choose another valid option when the script starts.
 #   FLASH        -> Flash Only, default duration 3 hours, channelmv=300
-#   HYBRID       -> Hybrid, default duration 6 hours, no channelmv
+#   HYBRID       -> Hybrid, default duration 3 hours, no channelmv
 #   FLUVIAL      -> Fluvial, default duration 120 hours, no channelmv
 #   FLASH3H      -> Flash Only, explicitly 3 hours, channelmv=300
 #   FLASH6H      -> Flash Only, explicitly 6 hours, channelmv=900
@@ -87,6 +87,10 @@ DEFAULT_RESOLUTION = "20m"
 # multipliers at the prompts. 1.0 means no scaling relative to the base value.
 DEFAULT_MULT_MAN = 1.0
 DEFAULT_MULT_INF = 1.0
+
+# --- FastFlood model options -------------------------------------------------
+# Return period passed to FastFlood in years
+RETURN_PERIOD = 1000
 
 # Default answer for retaining tile DEMs, per-tile rasters, and diagnostics.
 DEFAULT_KEEP_TILES = "no"
@@ -197,10 +201,6 @@ MIN_BLEND_WEIGHT = 0.01
 # block sizes must be multiples of 16; 256 is a practical general-purpose value.
 MOSAIC_BLOCK_SIZE = 256
 
-# --- FastFlood model options -------------------------------------------------
-# Return period passed to FastFlood (original script used 100). This script keeps
-# the original value for all three modes; change only if your scenarios require it.
-RETURN_PERIOD = 100
 
 # Value passed to FastFlood's -relmindabcond option. Its exact interpretation is
 # FastFlood-version-specific; retain the original value unless you know otherwise.
@@ -223,6 +223,38 @@ RESOLUTION_PRESETS = {"low": "150m", "medium": "80m", "high": "20m", "veryhigh":
 # chosen resolution; this list only validates the input before calling FastFlood.
 VALID_RESOLUTIONS = {"1m", "2m", "5m", "10m", "20m", "40m", "80m", "150m", "300m"}
 
+# Exact Web Mercator (EPSG:3857) pixel resolutions used internally by FastFlood
+# autohazard / autodem. Derived from Web Mercator circumference (40075016.6856m)
+# divided by (256 * 2^zoom_level). Using these exact pixel sizes prevents horizontal
+# and vertical coordinate discrepancies between staggered grid tiles.
+FASTFLOOD_MERCATOR_RESOLUTIONS = {
+    "1m": 40075016.68557849 / (256 * (2 ** 17)),      # ~1.19432856688m
+    "2m": 40075016.68557849 / (256 * (2 ** 16)),      # ~2.38865713375m
+    "2.5m": 40075016.68557849 / (256 * (2 ** 16)),    # ~2.38865713375m
+    "5m": 40075016.68557849 / (256 * (2 ** 15)),      # ~4.7773142675m
+    "10m": 40075016.68557849 / (256 * (2 ** 14)),     # ~9.554628535m
+    "20m": 40075016.68557849 / (256 * (2 ** 13)),     # ~19.109257071608m
+    "40m": 40075016.68557849 / (256 * (2 ** 12)),     # ~38.218514143217m
+    "80m": 40075016.68557849 / (256 * (2 ** 11)),     # ~76.437028286433m
+    "150m": 40075016.68557849 / (256 * (2 ** 10)),    # ~152.874056572866m
+    "300m": 40075016.68557849 / (256 * (2 ** 9)),     # ~305.748113145733m
+    "600m": 40075016.68557849 / (256 * (2 ** 8)),     # ~611.496226291465m
+    "1200m": 40075016.68557849 / (256 * (2 ** 7)),    # ~1222.99245258293m
+}
+
+
+def get_resolution_meters(res_str: str) -> float:
+    """Return exact pixel size in meters for a given resolution string."""
+    key = str(res_str).strip().lower()
+    if key in FASTFLOOD_MERCATOR_RESOLUTIONS:
+        return FASTFLOOD_MERCATOR_RESOLUTIONS[key]
+    val = key.rstrip("m")
+    try:
+        return float(val)
+    except ValueError:
+        return 19.109257071608298
+
+
 # Optional preconfigured DEM. Leave as None to be prompted for a DEM path each
 # run. If set to a valid file path here, the DEM prompt can be left blank to use it.
 DEFAULT_DEM_PATH = None
@@ -232,7 +264,7 @@ DEFAULT_DEM_PATH = None
 # =============================================================================
 SCENARIO = "flashfloodfluvialflood"  # FastFlood scenario identifier; verify for your installation.
 RESOLUTION = DEFAULT_RESOLUTION
-DURATION_HOURS = 6
+DURATION_HOURS = 3
 MULT_INF = DEFAULT_MULT_INF
 MULT_MAN = DEFAULT_MULT_MAN
 CHANNELMV = None
@@ -339,9 +371,9 @@ def build_tiles(src=None):
         px, py = abs(src.transform.a), abs(src.transform.e)
         transform = src.transform
     else:
-        # No DEM: build grid directly from BBOX in EPSG:3857 using indicated RESOLUTION
-        res_m = float(str(RESOLUTION).lower().rstrip("m"))
-        px, py = res_m, res_m
+        # No DEM: build grid directly from BBOX in EPSG:3857 using FastFlood's exact Web Mercator pixel resolution
+        px = get_resolution_meters(RESOLUTION)
+        py = px
         width = max(1, int(round((east - west) / px)))
         height = max(1, int(round((north - south) / py)))
         col0, row0 = 0, 0
@@ -641,18 +673,22 @@ def get_mosaic_profile(sample_raster=None):
             width, height = dem.width, dem.height
     else:
         west, south, east, north = BBOX
-        res_m = float(str(RESOLUTION).lower().rstrip("m"))
-        width = max(1, int(round((east - west) / res_m)))
-        height = max(1, int(round((north - south) / res_m)))
-        transform = rasterio.transform.from_origin(west, north, res_m, res_m)
         crs = rasterio.crs.CRS.from_epsg(3857)
+        res_x = get_resolution_meters(RESOLUTION)
+        res_y = res_x
         if sample_raster and Path(sample_raster).is_file():
             try:
                 with rasterio.open(sample_raster) as s:
                     if s.crs:
                         crs = s.crs
+                    if s.res and len(s.res) >= 2:
+                        res_x = float(s.res[0])
+                        res_y = float(s.res[1])
             except Exception:
                 pass
+        width = max(1, int(round((east - west) / res_x)))
+        height = max(1, int(round((north - south) / res_y)))
+        transform = rasterio.transform.from_origin(west, north, res_x, res_y)
     return {
         "driver": "GTiff", "width": width, "height": height, "count": 1,
         "dtype": "float32", "crs": crs, "transform": transform,
@@ -662,14 +698,16 @@ def get_mosaic_profile(sample_raster=None):
     }
 
 
-def mosaic_grid(tiles, grid, output):
-    """Blend valid depth tiles belonging to one grid into a DEM-aligned mosaic."""
+def mosaic_grid(tiles, grid, output, sample_raster=None):
+    """Blend valid depth tiles belonging to one grid into a georeferenced mosaic."""
     paths = [(t, output_paths(t)[0]) for t in tiles if t.grid == grid and valid_raster(output_paths(t)[0])]
     if not paths:
         log(f"No valid depth rasters for grid {grid}")
         return False
-    profile = get_mosaic_profile(paths[0][1] if paths else None)
+    ref_raster = sample_raster if (sample_raster and Path(sample_raster).is_file()) else paths[0][1]
+    profile = get_mosaic_profile(ref_raster)
     width, height = profile["width"], profile["height"]
+    mosaic_transform = profile["transform"]
     output.parent.mkdir(parents=True, exist_ok=True)
     sum_path, weight_path = output.with_suffix(".sum.tmp.tif"), output.with_suffix(".weight.tmp.tif")
     for p in (output, sum_path, weight_path):
@@ -684,17 +722,45 @@ def mosaic_grid(tiles, grid, output):
                 data = src.read(1, masked=True).astype("float32")
                 arr = np.asarray(data.filled(0), dtype="float32")
                 good = ~np.ma.getmaskarray(data) & np.isfinite(arr) & (arr != OUTPUT_NODATA)
-                tile_h = min(int(tile.height), data.shape[0], height - tile.row)
-                tile_w = min(int(tile.width), data.shape[1], width - tile.col)
-                if tile_h <= 0 or tile_w <= 0:
+
+                # Determine destination window from georeferenced bounds to guarantee
+                # exact coordinate alignment across all tiles and both grids.
+                tile_win = rasterio.windows.from_bounds(
+                    src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top,
+                    transform=mosaic_transform
+                )
+                dst_col = int(round(tile_win.col_off))
+                dst_row = int(round(tile_win.row_off))
+                dst_w = int(round(tile_win.width))
+                dst_h = int(round(tile_win.height))
+
+                c0 = max(0, dst_col)
+                r0 = max(0, dst_row)
+                c1 = min(width, dst_col + dst_w)
+                r1 = min(height, dst_row + dst_h)
+                if c1 <= c0 or r1 <= r0:
                     continue
-                win = Window(tile.col, tile.row, tile_w, tile_h)
-                arr = arr[:tile_h, :tile_w]
-                good = good[:tile_h, :tile_w]
-                wt = make_weights(tile_h, tile_w)
-                wt[~good] = 0
+
+                src_c0 = c0 - dst_col
+                src_r0 = r0 - dst_row
+                src_c1 = min(arr.shape[1], src_c0 + (c1 - c0))
+                src_r1 = min(arr.shape[0], src_r0 + (r1 - r0))
+
+                use_w = src_c1 - src_c0
+                use_h = src_r1 - src_r0
+                if use_w <= 0 or use_h <= 0:
+                    continue
+
+                win = Window(c0, r0, use_w, use_h)
+                tile_arr = arr[src_r0:src_r1, src_c0:src_c1]
+                tile_good = good[src_r0:src_r1, src_c0:src_c1]
+
+                wt_full = make_weights(arr.shape[0], arr.shape[1])
+                wt = wt_full[src_r0:src_r1, src_c0:src_c1].copy()
+                wt[~tile_good] = 0
+
                 old_s = sums.read(1, window=win); old_w = weights.read(1, window=win)
-                old_s += arr * wt; old_w += wt
+                old_s += tile_arr * wt; old_w += wt
                 sums.write(old_s, 1, window=win); weights.write(old_w, 1, window=win)
     with rasterio.open(sum_path) as sums, rasterio.open(weight_path) as weights, rasterio.open(output, "w", **profile) as dst:
         for _, win in dst.block_windows(1):
@@ -715,7 +781,18 @@ def combine_max(grid_a, grid_b, output):
         log("No valid grid mosaics available; combined mosaic was not created.")
         return False
 
-    profile = get_mosaic_profile(grid_a if has_a else grid_b)
+    ref = grid_a if has_a else grid_b
+    with rasterio.open(ref) as s:
+        profile = s.profile.copy()
+        profile.update({
+            "tiled": True,
+            "blockxsize": MOSAIC_BLOCK_SIZE,
+            "blockysize": MOSAIC_BLOCK_SIZE,
+            "compress": "DEFLATE",
+            "predictor": 3,
+            "BIGTIFF": "IF_SAFER",
+        })
+
     output.parent.mkdir(parents=True, exist_ok=True)
     from contextlib import ExitStack
     with ExitStack() as stack:
@@ -895,7 +972,7 @@ def main():
         "FLASH": ("flash", 3),
         "FLASH3H": ("flash", 3),
         "FLASH6H": ("flash", 6),
-        "HYBRID": ("hybrid", 6),
+        "HYBRID": ("hybrid", 3),
         "FLUVIAL": ("fluvial", 120),
         "FLUVIAL72H": ("fluvial", 72),
         "FLUVIAL120H": ("fluvial", 120),
@@ -1121,8 +1198,13 @@ def main():
         a = OUTPUT_ROOT / f"grid_A_depth_blended_{mode_tag}_{DURATION_HOURS}h_{RESOLUTION}.tif"
         b = OUTPUT_ROOT / f"grid_B_depth_blended_{mode_tag}_{DURATION_HOURS}h_{RESOLUTION}.tif"
         final = OUTPUT_ROOT / f"depth_dualgrid_max_{mode_tag}_{DURATION_HOURS}h_{RESOLUTION}.tif"
-        mosaic_grid(tiles, "A", a)
-        mosaic_grid(tiles, "B", b)
+
+        # Share the same reference sample raster across both grids so they lock to identical pixel geometry
+        all_depth_rasters = [output_paths(t)[0] for t in tiles if valid_raster(output_paths(t)[0])]
+        ref_sample = all_depth_rasters[0] if all_depth_rasters else None
+
+        mosaic_grid(tiles, "A", a, sample_raster=ref_sample)
+        mosaic_grid(tiles, "B", b, sample_raster=ref_sample)
         combine_max(a, b, final)
         if not KEEP_INTERMEDIATE_GRIDS:
             a.unlink(missing_ok=True)
