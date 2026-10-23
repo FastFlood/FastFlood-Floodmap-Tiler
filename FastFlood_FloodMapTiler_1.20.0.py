@@ -43,13 +43,14 @@ from __future__ import annotations
 import csv
 import math
 import os
+import shutil
 import subprocess
 import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -92,7 +93,38 @@ DEFAULT_KEEP_TILES = "no"
 
 # Default API-key prompt value. <KEY> is deliberately a placeholder, not a
 # credential; enter a valid key when prompted if your FastFlood setup requires it.
-DEFAULT_API_KEY = "<KEY>"
+DEFAULT_API_KEY = "Xx1BfVGbNP76RwYlmQtR8os4halVCpxH"
+
+# --- Primary run paths and bounding box --------------------------------------
+# Optional full path to an input DEM GeoTIFF covering the simulation area.
+# Supported formats: string path or Path object (e.g. r"C:\data\dem.tif").
+# If None: no -dem option is passed to FastFlood; autohazard automatically
+# downloads its own DEM at the indicated resolution.
+# If provided: the DEM's resolution (in meters equivalent) is used for the run,
+# and raw pixel data is supplied to FastFlood via -dem.
+DEM_PATH = None
+
+# Bounding box as a tuple or list of 4 numbers: (west, south, east, north).
+# Supports both:
+#   1. WGS84 geographic coordinates in decimal degrees (e.g. (5.58, 52.156, 6.08, 52.36)).
+#   2. Pseudo-Mercator coordinates in meters (EPSG:3857, e.g. (621162, 6828381, 676822, 6865481)).
+#   3. DEM native CRS coordinates.
+# Coordinates are automatically swapped if west > east or south > north,
+# and automatically converted to the DEM's CRS if needed.
+# Example: BBOX = (5.58, 52.156, 6.08, 52.36)
+BBOX = (5.581681845, 52.367139577, 6.0809759, 52.156432878)
+
+# Directory where simulation outputs, tile files, mosaics, and logs will be saved.
+# Can be a parent directory (a parameter-named subfolder will be created inside it)
+# or an explicit directory path (e.g. r"C:\data\flood_output").
+# Example: OUTPUT_ROOT = r"C:\data\flood_output"
+OUTPUT_ROOT = "./output/"
+
+# Option to ask for manual input interactively via console prompts.
+# Default: False ("no"), which skips all interactive user prompts and runs directly
+# using the configured settings above (DEM_PATH, BBOX, OUTPUT_ROOT, RUN_MODE, etc.).
+# Set to True ("yes") to ask for inputs via console prompts at run time.
+ASK_FOR_MANUAL_INPUT = False
 
 # =============================================================================
 # ADVANCED SETTINGS — EDIT ONLY WHEN YOU NEED TO CHANGE THE WORKFLOW
@@ -104,12 +136,12 @@ DEFAULT_API_KEY = "<KEY>"
 # Full path to FastFlood's command-line executable. The environment variable
 # FASTFLOOD_EXE takes precedence, which is useful on machines with different
 # install locations. Update the fallback path to match your own installation.
-FASTFLOOD_EXE = Path(os.environ.get("FASTFLOOD_EXE", r"C:\FastFlood\fastflood.exe"))
+FASTFLOOD_EXE = Path(os.environ.get("FASTFLOOD_EXE", r"fastflood.exe"))
 
-# CRS expected for the DEM and for all four bounding-box coordinates. EPSG:32735
-# is inherited from the original script; change it if your DEM uses another CRS.
-# The DEM itself is not reprojected automatically.
-EXPECTED_DEM_CRS = "EPSG:32735"
+# CRS expected for the DEM. Default is EPSG:3857 (Pseudo-Mercator), which is standard
+# for FastFlood and web mapping. If your DEM uses another CRS, specify it here or set
+# to None to automatically accept and use whatever CRS is defined in the DEM GeoTIFF.
+EXPECTED_DEM_CRS = "None"
 
 # Sentinel written to pixels that have no valid data. Keep this consistent
 # across tile rasters and mosaics; changing it is generally not necessary.
@@ -148,6 +180,10 @@ CREATE_MOSAICS = True
 # If False, any failed tile prevents mosaics from being created. Set True only if
 # you explicitly accept mosaics with gaps where failed tiles should have contributed.
 ALLOW_INCOMPLETE_MOSAIC = False
+
+# If False (default), delete intermediate grid A and grid B blended GeoTIFFs after
+# the final dualgrid max-combined mosaic is created, keeping only the final one.
+KEEP_INTERMEDIATE_GRIDS = False
 
 # Width of the feather/blending edge as a fraction of tile dimensions. By default
 # it follows the tile overlap, so edge weights taper across the overlap zone.
@@ -192,19 +228,14 @@ VALID_RESOLUTIONS = {"1m", "2m", "5m", "10m", "20m", "40m", "80m", "150m", "300m
 DEFAULT_DEM_PATH = None
 
 # =============================================================================
-# RUNTIME SETTINGS — populated from prompts in main(); normally do not edit.
+# RUNTIME STATE — updated during execution in main(); normally do not edit.
 # =============================================================================
-# DEM_PATH: the DEM actually used by this run (required for tiling/mosaicking).
-# OUTPUT_ROOT: unique, parameter-named directory created under the output folder.
-DEM_PATH = None
-OUTPUT_ROOT = None
 SCENARIO = "flashfloodfluvialflood"  # FastFlood scenario identifier; verify for your installation.
 RESOLUTION = DEFAULT_RESOLUTION
 DURATION_HOURS = 6
 MULT_INF = DEFAULT_MULT_INF
 MULT_MAN = DEFAULT_MULT_MAN
 CHANNELMV = None
-BBOX = None
 KEEP_TILES = False
 API_KEY = "<KEY>"
 DEPTH_TILE_NAME = "flooddepth.tif"
@@ -284,43 +315,58 @@ def make_axis_starts(length, tile_length, shift=0):
     return sorted(set(starts))
 
 
-def build_tiles(src):
+def build_tiles(src=None):
     """Build two staggered overlapping tile grids within the requested bbox.
 
-    The requested bbox is converted to pixel coordinates in the DEM. The area is
-    then covered by Grid A and a half-stride-shifted Grid B. Tiles are clipped to
-    the selected area and DEM edges; the input DEM is not resampled or reprojected.
+    If a DEM is provided (src is not None), coordinates are mapped to pixel
+    coordinates within the DEM.
+    If no DEM is provided (src is None), a virtual grid is built over BBOX in
+    EPSG:3857 at the indicated RESOLUTION, and FastFlood autohazard downloads
+    its own DEM for each tile.
     """
-    if not math.isclose(src.transform.b, 0, abs_tol=1e-10) or not math.isclose(src.transform.d, 0, abs_tol=1e-10):
-        raise ValueError("Rotated DEM grids are not supported; rectify the DEM first.")
     from rasterio.windows import from_bounds
     west, south, east, north = BBOX
-    raw = from_bounds(west, south, east, north, src.transform)
-    col0, row0 = max(0, int(math.floor(raw.col_off))), max(0, int(math.floor(raw.row_off)))
-    col1 = min(src.width, int(math.ceil(raw.col_off + raw.width)))
-    row1 = min(src.height, int(math.ceil(raw.row_off + raw.height)))
-    if col1 <= col0 or row1 <= row0:
-        raise ValueError("Bounding box does not overlap the DEM.")
-    px, py = abs(src.transform.a), abs(src.transform.e)
-    area_width, area_height = col1-col0, row1-row0
-    tw, th = max(1, int(round(TILE_SIZE_KM*1000/px))), max(1, int(round(TILE_SIZE_KM*1000/py)))
-    stride_x, stride_y = max(1, int(round(tw*(1-TILE_OVERLAP_PERCENT)))), max(1, int(round(th*(1-TILE_OVERLAP_PERCENT))))
+
+    if src is not None:
+        if not math.isclose(src.transform.b, 0, abs_tol=1e-10) or not math.isclose(src.transform.d, 0, abs_tol=1e-10):
+            raise ValueError("Rotated DEM grids are not supported; rectify the DEM first.")
+        raw = from_bounds(west, south, east, north, src.transform)
+        col0, row0 = max(0, int(math.floor(raw.col_off))), max(0, int(math.floor(raw.row_off)))
+        col1 = min(src.width, int(math.ceil(raw.col_off + raw.width)))
+        row1 = min(src.height, int(math.ceil(raw.row_off + raw.height)))
+        if col1 <= col0 or row1 <= row0:
+            raise ValueError("Bounding box does not overlap the DEM.")
+        px, py = abs(src.transform.a), abs(src.transform.e)
+        transform = src.transform
+    else:
+        # No DEM: build grid directly from BBOX in EPSG:3857 using indicated RESOLUTION
+        res_m = float(str(RESOLUTION).lower().rstrip("m"))
+        px, py = res_m, res_m
+        width = max(1, int(round((east - west) / px)))
+        height = max(1, int(round((north - south) / py)))
+        col0, row0 = 0, 0
+        col1, row1 = width, height
+        transform = rasterio.transform.from_origin(west, north, px, py)
+
+    area_width, area_height = col1 - col0, row1 - row0
+    tw, th = max(1, int(round(TILE_SIZE_KM * 1000 / px))), max(1, int(round(TILE_SIZE_KM * 1000 / py)))
+    stride_x, stride_y = max(1, int(round(tw * (1 - TILE_OVERLAP_PERCENT)))), max(1, int(round(th * (1 - TILE_OVERLAP_PERCENT))))
     grids = {
         "A": (make_axis_starts(area_width, tw), make_axis_starts(area_height, th)),
-        "B": (make_axis_starts(area_width, tw, stride_x*GRID_B_OFFSET_SPACING_FRACTION),
-              make_axis_starts(area_height, th, stride_y*GRID_B_OFFSET_SPACING_FRACTION)),
+        "B": (make_axis_starts(area_width, tw, stride_x * GRID_B_OFFSET_SPACING_FRACTION),
+              make_axis_starts(area_height, th, stride_y * GRID_B_OFFSET_SPACING_FRACTION)),
     }
     tiles = []
     for grid, (xs, ys) in grids.items():
         for r, y in enumerate(ys):
             for c, x in enumerate(xs):
-                x0, y0 = col0+x, row0+y
-                x1, y1 = min(col1, col0+x+tw), min(row1, row0+y+th)
+                x0, y0 = col0 + x, row0 + y
+                x1, y1 = min(col1, col0 + x + tw), min(row1, row0 + y + th)
                 if x1 <= x0 or y1 <= y0:
                     continue
-                win = Window(x0, y0, x1-x0, y1-y0)
-                west_t, south_t, east_t, north_t = rasterio.windows.bounds(win, src.transform)
-                tiles.append(Tile(grid, f"tile_{r:03d}_{c:03d}", x0, y0, int(x1-x0), int(y1-y0),
+                win = Window(x0, y0, x1 - x0, y1 - y0)
+                west_t, south_t, east_t, north_t = rasterio.windows.bounds(win, transform)
+                tiles.append(Tile(grid, f"tile_{r:03d}_{c:03d}", x0, y0, int(x1 - x0), int(y1 - y0),
                                   west_t, north_t, east_t, south_t))
     return tiles
 
@@ -328,6 +374,8 @@ def build_tiles(src):
 
 def clip_dem(tile, target):
     """Write the DEM window for a tile to a compressed Float32 GeoTIFF."""
+    if DEM_PATH is None or not Path(DEM_PATH).is_file():
+        return
     win = Window(tile.col, tile.row, tile.width, tile.height)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(".tmp.tif")
@@ -375,28 +423,158 @@ def build_command(tile, dem_file, depth_file, discharge_file, api_key):
         str(tile.west), str(tile.north), str(tile.east), str(tile.south),
         SCENARIO, str(RETURN_PERIOD), RESOLUTION, "-sim", *CHANNEL_ARGS,
         "-designdatadur", str(DURATION_HOURS), "-relmindabcond", str(RELMINDABCOND),
-        "-dem", str(dem_file.resolve()), "-d_lu", "-d_inf",
+    ]
+    if dem_file is not None:
+        command.extend(["-dem", str(dem_file.resolve())])
+    command.extend([
+        "-d_lu", "-d_inf",
         "-whout", str(depth_file.resolve()), "-qout", str(discharge_file.resolve()),
         "-dur", str(DURATION_HOURS), "-mult_inf", str(MULT_INF), "-mult_man", str(MULT_MAN),
         "-noautorefine", "-nochanwh",
-    ]
+    ])
     if CHANNELMV is not None:
         command.extend(["-channelmv", str(CHANNELMV)])
     return command
 
 
-def run_tile(tile, api_key):
+class ProgressTracker:
+    """Track and log execution progress, running tile count, ETA, and completions."""
+
+    def __init__(self, total_tiles: int, max_workers: int):
+        self.total = total_tiles
+        self.max_workers = max_workers
+        self.lock = threading.Lock()
+        self.start_time = time.time()
+        self.started_count = 0
+        self.completed_count = 0
+        self.failed_count = 0
+        self.skipped_count = 0
+        self.active_tiles: dict[str, float] = {}  # "grid/tile_id" -> start monotonic
+        self.completed_durations: list[float] = []
+
+    @staticmethod
+    def format_duration(seconds: float) -> str:
+        s_total = max(0, int(round(seconds)))
+        h = s_total // 3600
+        m = (s_total % 3600) // 60
+        s = s_total % 60
+        if h > 0:
+            return f"{h}h {m:02d}m {s:02d}s"
+        elif m > 0:
+            return f"{m}m {s:02d}s"
+        else:
+            return f"{s}s"
+
+    def tile_started(self, tile: Tile):
+        with self.lock:
+            self.started_count += 1
+            t_key = f"{tile.grid}/{tile.tile_id}"
+            self.active_tiles[t_key] = time.monotonic()
+            running = len(self.active_tiles)
+            queued = max(0, self.total - self.started_count)
+            done = self.completed_count
+            pct = (done / self.total * 100.0) if self.total > 0 else 0.0
+
+            log(
+                f"[TILE START {self.started_count}/{self.total}] {t_key} | "
+                f"Active workers: {running}/{self.max_workers} | "
+                f"Queued: {queued} | Done so far: {done}/{self.total} ({pct:.1f}%)"
+            )
+
+    def tile_finished(self, tile: Tile, result: dict):
+        with self.lock:
+            self.completed_count += 1
+            status = result.get("status", "unknown")
+            if status == "failed":
+                self.failed_count += 1
+            elif status == "skipped":
+                self.skipped_count += 1
+
+            t_key = f"{tile.grid}/{tile.tile_id}"
+            tile_start = self.active_tiles.pop(t_key, None)
+            tile_dur = (time.monotonic() - tile_start) if tile_start else result.get("elapsed_seconds", 0)
+            self.completed_durations.append(tile_dur)
+
+            now = time.time()
+            elapsed_total = now - self.start_time
+            done = self.completed_count
+            remaining = self.total - done
+            pct = (done / self.total * 100.0) if self.total > 0 else 100.0
+
+            if done > 0 and remaining > 0:
+                rate = done / elapsed_total
+                eta_sec = remaining / rate
+                eta_dt = datetime.now() + timedelta(seconds=eta_sec)
+                eta_str = f"~{self.format_duration(eta_sec)} (est. finish: {eta_dt.strftime('%H:%M:%S')})"
+            elif remaining == 0:
+                eta_str = "Done (final tile)"
+            else:
+                eta_str = "Calculating..."
+
+            running = len(self.active_tiles)
+            queued = max(0, self.total - self.started_count)
+            active_list = f" | Still running: {', '.join(sorted(self.active_tiles.keys()))}" if self.active_tiles else ""
+
+            tag = "DONE" if status in ("completed", "skipped") else "FAILED"
+            log(
+                f"[TILE {tag} {done}/{self.total}] {t_key}: {status} ({tile_dur:.1f}s) | "
+                f"Progress: {done}/{self.total} ({pct:.1f}%) | "
+                f"Elapsed: {self.format_duration(elapsed_total)} | "
+                f"ETA: {eta_str}{active_list}"
+            )
+
+    def get_heartbeat_message(self) -> str | None:
+        with self.lock:
+            if self.completed_count >= self.total:
+                return None
+            now_mono = time.monotonic()
+            now_real = time.time()
+            elapsed_total = now_real - self.start_time
+            done = self.completed_count
+            remaining = self.total - done
+            pct = (done / self.total * 100.0) if self.total > 0 else 0.0
+
+            if done > 0 and remaining > 0:
+                rate = done / elapsed_total
+                eta_sec = remaining / rate
+                eta_dt = datetime.now() + timedelta(seconds=eta_sec)
+                eta_str = f"~{self.format_duration(eta_sec)} (est. finish: {eta_dt.strftime('%H:%M:%S')})"
+            else:
+                eta_str = "Calculating (waiting for first tile to finish)..."
+
+            running = len(self.active_tiles)
+            queued = max(0, self.total - self.started_count)
+            active_info = []
+            for k, s_mono in sorted(self.active_tiles.items()):
+                active_info.append(f"{k} ({int(now_mono - s_mono)}s)")
+            active_str = f" | Processing: {', '.join(active_info)}" if active_info else ""
+
+            return (
+                f"[HEARTBEAT] {done}/{self.total} done ({pct:.1f}%), "
+                f"{running} running, {queued} queued | "
+                f"Elapsed: {self.format_duration(elapsed_total)} | "
+                f"ETA: {eta_str}{active_str}"
+            )
+
+
+def run_tile(tile, api_key, tracker=None):
     """Prepare one tile, run FastFlood, save diagnostics, and report its status."""
     started = time.monotonic()
     directory = tile_dir(tile)
     directory.mkdir(parents=True, exist_ok=True)
     depth, discharge = output_paths(tile)
     result = {"grid": tile.grid, "tile": tile.tile_id}
-    if SKIP_VALID_EXISTING_TILES and valid_raster(depth) and valid_raster(discharge):
-        return {**result, "status": "skipped", "message": "Existing readable outputs", "elapsed_seconds": 0}
-    dem_file = directory / "dem_tile.tif"
+
+    if tracker:
+        tracker.tile_started(tile)
+
     try:
-        clip_dem(tile, dem_file)
+        if SKIP_VALID_EXISTING_TILES and valid_raster(depth) and valid_raster(discharge):
+            result.update({"status": "skipped", "message": "Existing readable outputs", "elapsed_seconds": 0})
+            return result
+        dem_file = directory / "dem_tile.tif" if (DEM_PATH is not None and Path(DEM_PATH).is_file()) else None
+        if dem_file is not None:
+            clip_dem(tile, dem_file)
         command = build_command(tile, dem_file, depth, discharge, api_key)
         (directory / "command.txt").write_text(redact_command(command), encoding="utf-8")
         completed = subprocess.run(command, cwd=directory, capture_output=True, text=True, errors="replace")
@@ -409,10 +587,15 @@ def run_tile(tile, api_key):
             msg, status = "FastFlood returned success but one or more output rasters are invalid", "failed"
         else:
             msg, status = "OK", "completed"
+        result.update({"status": status, "message": msg, "elapsed_seconds": round(time.monotonic()-started, 2)})
     except Exception as exc:
-        msg, status = f"{exc}\n{traceback.format_exc()}", "failed"
+        msg = f"{exc}\n{traceback.format_exc()}"
         (directory / "stderr.txt").write_text(msg, encoding="utf-8")
-    return {**result, "status": status, "message": msg, "elapsed_seconds": round(time.monotonic()-started, 2)}
+        result.update({"status": "failed", "message": msg, "elapsed_seconds": round(time.monotonic()-started, 2)})
+    finally:
+        if tracker:
+            tracker.tile_finished(tile, result)
+    return result
 
 
 def write_manifest(tiles, results):
@@ -450,35 +633,65 @@ def make_weights(h, w):
     return np.maximum(wy[:, None]*wx[None, :], MIN_BLEND_WEIGHT).astype("float32")
 
 
+def get_mosaic_profile(sample_raster=None):
+    """Return rasterio profile dictionary for creating mosaic GeoTIFFs."""
+    if DEM_PATH is not None and Path(DEM_PATH).is_file():
+        with rasterio.open(DEM_PATH) as dem:
+            crs, transform = dem.crs, dem.transform
+            width, height = dem.width, dem.height
+    else:
+        west, south, east, north = BBOX
+        res_m = float(str(RESOLUTION).lower().rstrip("m"))
+        width = max(1, int(round((east - west) / res_m)))
+        height = max(1, int(round((north - south) / res_m)))
+        transform = rasterio.transform.from_origin(west, north, res_m, res_m)
+        crs = rasterio.crs.CRS.from_epsg(3857)
+        if sample_raster and Path(sample_raster).is_file():
+            try:
+                with rasterio.open(sample_raster) as s:
+                    if s.crs:
+                        crs = s.crs
+            except Exception:
+                pass
+    return {
+        "driver": "GTiff", "width": width, "height": height, "count": 1,
+        "dtype": "float32", "crs": crs, "transform": transform,
+        "nodata": OUTPUT_NODATA, "tiled": True,
+        "blockxsize": MOSAIC_BLOCK_SIZE, "blockysize": MOSAIC_BLOCK_SIZE,
+        "compress": "DEFLATE", "predictor": 3, "BIGTIFF": "IF_SAFER",
+    }
+
+
 def mosaic_grid(tiles, grid, output):
     """Blend valid depth tiles belonging to one grid into a DEM-aligned mosaic."""
     paths = [(t, output_paths(t)[0]) for t in tiles if t.grid == grid and valid_raster(output_paths(t)[0])]
     if not paths:
         log(f"No valid depth rasters for grid {grid}")
         return False
-    with rasterio.open(DEM_PATH) as dem:
-        crs, transform = dem.crs, dem.transform
-        width, height = dem.width, dem.height
-    profile = {"driver":"GTiff", "width":width, "height":height, "count":1, "dtype":"float32", "crs":crs, "transform":transform, "nodata":OUTPUT_NODATA, "tiled":True, "blockxsize":MOSAIC_BLOCK_SIZE, "blockysize":MOSAIC_BLOCK_SIZE, "compress":"DEFLATE", "predictor":3, "BIGTIFF":"IF_SAFER"}
+    profile = get_mosaic_profile(paths[0][1] if paths else None)
+    width, height = profile["width"], profile["height"]
     output.parent.mkdir(parents=True, exist_ok=True)
     sum_path, weight_path = output.with_suffix(".sum.tmp.tif"), output.with_suffix(".weight.tmp.tif")
     for p in (output, sum_path, weight_path):
         if p.exists(): p.unlink()
     acc_profile = dict(profile); acc_profile["nodata"] = None
-    # Open accumulators in read/write mode: the blending loop reads previous
-    # values back from these files for each overlapping tile.
     with rasterio.open(sum_path, "w+", **acc_profile) as sums, rasterio.open(weight_path, "w+", **acc_profile) as weights:
-        # Initialize valid zero-valued accumulators in bounded windows.
         for _, win in sums.block_windows(1):
             z = np.zeros((int(win.height), int(win.width)), dtype="float32")
             sums.write(z, 1, window=win); weights.write(z, 1, window=win)
         for tile, path in paths:
-            win = Window(tile.col, tile.row, tile.width, tile.height)
             with rasterio.open(path) as src:
                 data = src.read(1, masked=True).astype("float32")
                 arr = np.asarray(data.filled(0), dtype="float32")
                 good = ~np.ma.getmaskarray(data) & np.isfinite(arr) & (arr != OUTPUT_NODATA)
-                wt = make_weights(tile.height, tile.width)
+                tile_h = min(int(tile.height), data.shape[0], height - tile.row)
+                tile_w = min(int(tile.width), data.shape[1], width - tile.col)
+                if tile_h <= 0 or tile_w <= 0:
+                    continue
+                win = Window(tile.col, tile.row, tile_w, tile_h)
+                arr = arr[:tile_h, :tile_w]
+                good = good[:tile_h, :tile_w]
+                wt = make_weights(tile_h, tile_w)
                 wt[~good] = 0
                 old_s = sums.read(1, window=win); old_w = weights.read(1, window=win)
                 old_s += arr * wt; old_w += wt
@@ -502,15 +715,7 @@ def combine_max(grid_a, grid_b, output):
         log("No valid grid mosaics available; combined mosaic was not created.")
         return False
 
-    with rasterio.open(DEM_PATH) as dem:
-        profile = {
-            "driver": "GTiff", "width": dem.width, "height": dem.height,
-            "count": 1, "dtype": "float32", "crs": dem.crs,
-            "transform": dem.transform, "nodata": OUTPUT_NODATA,
-            "tiled": True, "blockxsize": MOSAIC_BLOCK_SIZE,
-            "blockysize": MOSAIC_BLOCK_SIZE, "compress": "DEFLATE",
-            "predictor": 3, "BIGTIFF": "IF_SAFER",
-        }
+    profile = get_mosaic_profile(grid_a if has_a else grid_b)
     output.parent.mkdir(parents=True, exist_ok=True)
     from contextlib import ExitStack
     with ExitStack() as stack:
@@ -583,6 +788,99 @@ def ask_float(prompt, default):
         print("Enter a valid number.")
 
 
+def normalize_and_convert_bbox(
+    bbox: tuple[float, float, float, float],
+    dem_crs: rasterio.crs.CRS,
+    dem_bounds: rasterio.coords.BoundingBox | None = None,
+) -> tuple[tuple[float, float, float, float], tuple[float, float, float, float]]:
+    """Normalize bbox coordinates (swap if inverted) and convert to DEM CRS if needed.
+
+    Returns:
+        (swapped_input_bbox, converted_dem_bbox)
+    """
+    from rasterio.warp import transform_bounds
+
+    west, south, east, north = bbox
+    # Swap coordinates if inverted
+    if west > east:
+        print(f"Notice: West ({west}) > East ({east}); automatically swapping them.")
+        west, east = east, west
+    if south > north:
+        print(f"Notice: South ({south}) > North ({north}); automatically swapping them.")
+        south, north = north, south
+    if math.isclose(west, east) or math.isclose(south, north):
+        raise ValueError(f"Bounding box cannot have zero width or height: west={west}, south={south}, east={east}, north={north}")
+
+    swapped_input = (west, south, east, north)
+
+    # Check for WGS84 (EPSG:4326 lat/lon in decimal degrees)
+    is_wgs84 = (-180.0 <= west <= 180.0 and -180.0 <= east <= 180.0 and
+                -90.0 <= south <= 90.0 and -90.0 <= north <= 90.0)
+
+    wgs84_crs = rasterio.crs.CRS.from_epsg(4326)
+    pseudo_mercator_crs = rasterio.crs.CRS.from_epsg(3857)
+
+    if is_wgs84:
+        if dem_crs != wgs84_crs:
+            cw, cs, ce, cn = transform_bounds(wgs84_crs, dem_crs, west, south, east, north)
+            cw, ce = min(cw, ce), max(cw, ce)
+            cs, cn = min(cs, cn), max(cs, cn)
+            print(f"Converted bounding box from WGS84 (EPSG:4326) to DEM CRS ({dem_crs}):")
+            print(f"  Input WGS84:  (west={west}, south={south}, east={east}, north={north})")
+            print(f"  DEM CRS bbox: (west={cw:.2f}, south={cs:.2f}, east={ce:.2f}, north={cn:.2f})")
+            return swapped_input, (cw, cs, ce, cn)
+        return swapped_input, swapped_input
+
+    # Projected coordinates in meters (e.g. Pseudo-Mercator EPSG:3857 or DEM CRS)
+    if dem_crs == pseudo_mercator_crs:
+        # DEM is already Pseudo-Mercator; input is already in Pseudo-Mercator
+        return swapped_input, swapped_input
+
+    # If DEM is another projected CRS (e.g. UTM):
+    if dem_bounds is not None:
+        native_overlap = not (east < dem_bounds.left or west > dem_bounds.right or
+                              north < dem_bounds.bottom or south > dem_bounds.top)
+        if not native_overlap:
+            # Check if converting from Pseudo-Mercator (EPSG:3857) to DEM CRS overlaps DEM
+            try:
+                cw, cs, ce, cn = transform_bounds(pseudo_mercator_crs, dem_crs, west, south, east, north)
+                cw, ce = min(cw, ce), max(cw, ce)
+                cs, cn = min(cs, cn), max(cs, cn)
+                converted_overlap = not (ce < dem_bounds.left or cw > dem_bounds.right or
+                                         cn < dem_bounds.bottom or cs > dem_bounds.top)
+                if converted_overlap:
+                    print(f"Detected Pseudo-Mercator (EPSG:3857) coordinates; converted to DEM CRS ({dem_crs}):")
+                    print(f"  Input:        (west={west}, south={south}, east={east}, north={north})")
+                    print(f"  DEM CRS bbox: (west={cw:.2f}, south={cs:.2f}, east={ce:.2f}, north={cn:.2f})")
+                    return swapped_input, (cw, cs, ce, cn)
+            except Exception:
+                pass
+
+    return swapped_input, swapped_input
+
+
+def get_dem_resolution_str(px: float) -> str:
+    """Return closest FastFlood supported resolution string for given DEM pixel size in meters."""
+    r_int = round(px)
+    cand = f"{r_int}m"
+    if cand in VALID_RESOLUTIONS:
+        return cand
+    std_res = [1, 2, 5, 10, 20, 40, 80, 150, 300]
+    closest = min(std_res, key=lambda r: abs(r - px))
+    return f"{closest}m"
+
+
+def resolve_fastflood_exe() -> Path:
+    """Locate FastFlood executable either directly as a file path or via system PATH."""
+    exe_str = str(FASTFLOOD_EXE)
+    if Path(exe_str).is_file():
+        return Path(exe_str).resolve()
+    found = shutil.which(exe_str) or shutil.which("fastflood") or shutil.which("fastflood.exe")
+    if found:
+        return Path(found).resolve()
+    return Path(exe_str)
+
+
 def main():
     """Collect run settings, execute tile jobs, blend each grid, then max-combine.
 
@@ -591,23 +889,10 @@ def main():
     """
     global DEM_PATH, OUTPUT_ROOT, SCENARIO, RESOLUTION, DURATION_HOURS
     global MULT_INF, MULT_MAN, CHANNELMV, BBOX, KEEP_TILES, API_KEY
-    global DEPTH_TILE_NAME, DISCHARGE_TILE_NAME
+    global DEPTH_TILE_NAME, DISCHARGE_TILE_NAME, FASTFLOOD_EXE
 
-    # -------------------------------------------------------------------------
-    # REQUIRED RUN INPUTS: mode, bbox, resolution, output folder, and DEM source.
-    # OPTIONAL/DEFAULTED INPUTS: duration override, calibration, tile retention,
-    # and API key. RUN_MODE at the top sets the default offered by the prompt.
-    # -------------------------------------------------------------------------
-    print("\nFastFlood — simple flood simulation setup")
-    print("\nREQUIRED INPUTS")
-    print(f"Bounding-box coordinates must use the DEM CRS ({EXPECTED_DEM_CRS}).")
-
-    # Mode aliases encode the common scenario/duration combinations. Generic
-    # FLASH, HYBRID, and FLUVIAL use their standard defaults; explicit aliases
-    # such as FLASH6H set a specific duration unless a valid override is supplied.
     mode_aliases = {
-        "FLASH": ("flash", 3),        
-	"FLASH3H": ("flash", 1),
+        "FLASH": ("flash", 3),
         "FLASH3H": ("flash", 3),
         "FLASH6H": ("flash", 6),
         "HYBRID": ("hybrid", 6),
@@ -615,118 +900,216 @@ def main():
         "FLUVIAL72H": ("fluvial", 72),
         "FLUVIAL120H": ("fluvial", 120),
     }
-    default_mode = RUN_MODE.strip().upper()
-    if default_mode not in mode_aliases:
-        raise ValueError(f"RUN_MODE must be one of: {', '.join(mode_aliases)}")
-    chosen = ask_choice(
-        "Scenario/mode",
-        list(mode_aliases),
-        default_mode,
-    )
-    mode, implied_duration = mode_aliases[chosen]
 
-    # An explicit configuration override wins over the alias's implied duration.
-    # If no override is configured, the user can accept the inferred duration or
-    # choose another valid duration for the selected mode at the prompt.
-    allowed_durations = [72, 120] if mode == "fluvial" else [1, 3, 6]
-    duration_default = DURATION_HOURS_OVERRIDE if DURATION_HOURS_OVERRIDE is not None else implied_duration
-    if duration_default not in allowed_durations:
-        raise ValueError(f"Duration override {duration_default!r} is invalid for {chosen}; choose {allowed_durations}.")
-    DURATION_HOURS = int(ask_choice("Duration in hours", allowed_durations, duration_default))
+    # Determine whether to ask for manual input or use configured settings directly
+    manual_input = ASK_FOR_MANUAL_INPUT if isinstance(ASK_FOR_MANUAL_INPUT, bool) else str(ASK_FOR_MANUAL_INPUT).strip().lower() in ("yes", "true", "1", "y")
 
-    # channelmv is derived from the effective mode and duration. It is only used
-    # for Flash Only; Hybrid and Fluvial deliberately omit the CLI option.
-    CHANNELMV = ({1: 100, 3: 300, 6: 900}[DURATION_HOURS] if mode == "flash" else None)
+    if not manual_input:
+        print("\nFastFlood — simple flood simulation runner")
+        print("Running with configured settings (ASK_FOR_MANUAL_INPUT is False). Skipping user prompts.")
 
-    # A named preset is translated through RESOLUTION_PRESETS. Literal values are
-    # passed to FastFlood as typed. The default is 20m if the user presses Enter.
-    while True:
-        raw = input("Resolution (low/medium/high/veryhigh or 1m, 2m, 5m, 10m, 20m, 40m, 80m, 150m, 300m) [20m]: ").strip().lower() or DEFAULT_RESOLUTION
-        if raw in RESOLUTION_PRESETS:
-            RESOLUTION = RESOLUTION_PRESETS[raw]
-            break
-        if raw in VALID_RESOLUTIONS:
-            RESOLUTION = raw
-            break
-        print("Unsupported resolution. Please choose a listed preset or resolution.")
+        default_mode = RUN_MODE.strip().upper()
+        if default_mode not in mode_aliases:
+            raise ValueError(f"RUN_MODE must be one of: {', '.join(mode_aliases)}")
+        mode, implied_duration = mode_aliases[default_mode]
 
-    print("Enter bounding box in DEM CRS.")
-    # Coordinates are mandatory and intentionally have no defaults, so pressing
-    # Enter cannot accidentally run a simulation over a zero-sized/wrong area.
-    # The script also checks east > west and north > south below.
-    west = ask_required_float("West / minimum X")
-    south = ask_required_float("South / minimum Y")
-    east = ask_required_float("East / maximum X")
-    north = ask_required_float("North / maximum Y")
-    if east <= west or north <= south:
-        raise ValueError("Bounding box must have east > west and north > south.")
-    BBOX = (west, south, east, north)
+        allowed_durations = [72, 120] if mode == "fluvial" else [1, 3, 6]
+        duration_default = DURATION_HOURS_OVERRIDE if DURATION_HOURS_OVERRIDE is not None else implied_duration
+        if duration_default not in allowed_durations:
+            raise ValueError(f"Duration override {duration_default!r} is invalid for {default_mode}; choose {allowed_durations}.")
+        DURATION_HOURS = int(duration_default)
+        CHANNELMV = ({1: 100, 3: 300, 6: 900}[DURATION_HOURS] if mode == "flash" else None)
 
-    print("\nOPTIONAL INPUTS (press Enter to accept each default)")
-    # Calibration multipliers modify the corresponding FastFlood model inputs.
-    # A value of 1.0 leaves the original model parameter unscaled.
-    MULT_MAN = ask_float("MULT_MAN — Manning/roughness multiplier", DEFAULT_MULT_MAN)
-    MULT_INF = ask_float("MULT_INF — infiltration multiplier", DEFAULT_MULT_INF)
-    out_raw = input("Output folder: ").strip()
-    if not out_raw:
-        raise ValueError("Output folder is required.")
-    output_base = Path(out_raw).expanduser()
-    # The DEM path is optional only when DEFAULT_DEM_PATH was set above. The
-    # workflow itself requires a DEM because it must clip tiles and align mosaics.
-    configured_dem = Path(DEFAULT_DEM_PATH).expanduser() if DEFAULT_DEM_PATH else None
-    dem_hint = f" [{configured_dem}]" if configured_dem else ""
-    dem_raw = input(f"DEM file path{dem_hint} (Enter uses configured DEM if available): ").strip()
-    if dem_raw:
-        DEM_PATH = Path(dem_raw).expanduser()
-    elif configured_dem:
-        DEM_PATH = configured_dem
+        raw_res = DEFAULT_RESOLUTION.strip().lower()
+        if raw_res in RESOLUTION_PRESETS:
+            RESOLUTION = RESOLUTION_PRESETS[raw_res]
+        elif raw_res in VALID_RESOLUTIONS:
+            RESOLUTION = raw_res
+        else:
+            raise ValueError(f"Unsupported DEFAULT_RESOLUTION {DEFAULT_RESOLUTION!r}.")
+
+        if BBOX is None:
+            raise ValueError(
+                "BBOX is not configured. Please set BBOX = (west, south, east, north) in EASY-TO-FIND RUN SETTINGS "
+                "at the top of the file, or set ASK_FOR_MANUAL_INPUT = True to be prompted."
+            )
+        west, south, east, north = BBOX
+
+        MULT_MAN = float(DEFAULT_MULT_MAN)
+        MULT_INF = float(DEFAULT_MULT_INF)
+
+        if OUTPUT_ROOT is None:
+            raise ValueError(
+                "OUTPUT_ROOT is not configured. Please set OUTPUT_ROOT = r'...' in EASY-TO-FIND RUN SETTINGS "
+                "at the top of the file, or set ASK_FOR_MANUAL_INPUT = True to be prompted."
+            )
+        output_base = Path(OUTPUT_ROOT).expanduser()
+
+        effective_dem = DEM_PATH if DEM_PATH is not None else DEFAULT_DEM_PATH
+        if effective_dem is not None and str(effective_dem).strip().lower() not in ("none", ""):
+            DEM_PATH = Path(effective_dem).expanduser()
+        else:
+            DEM_PATH = None
+
+        KEEP_TILES = str(DEFAULT_KEEP_TILES).strip().lower() in ("yes", "true", "1")
+        API_KEY = str(DEFAULT_API_KEY).strip()
+
     else:
-        raise ValueError("No DEM supplied and DEFAULT_DEM_PATH is not configured. A DEM is required for this workflow.")
-    # Keeping tiles preserves each clipped DEM, tile outputs, command record, and
-    # stdout/stderr logs. If No, the tiles directory is deleted after a successful
-    # run; final mosaics, manifest, timings, and run.log remain in the run folder.
-    KEEP_TILES = ask_choice("Keep tiles and all associated per-tile files?", ["yes", "no"], DEFAULT_KEEP_TILES) == "yes"
-    # API keys are redacted from command.txt. Do not share logs that may contain
-    # other sensitive information. <KEY> is a placeholder, not a real credential.
-    API_KEY = input(f"API key [{DEFAULT_API_KEY}]: ").strip() or DEFAULT_API_KEY
+        print("\nFastFlood — simple flood simulation setup")
+        print("\nREQUIRED INPUTS")
+        print("Bounding box coordinates support WGS84 lat/lon degrees, Pseudo-Mercator meters, or DEM CRS.")
+
+        default_mode = RUN_MODE.strip().upper()
+        if default_mode not in mode_aliases:
+            raise ValueError(f"RUN_MODE must be one of: {', '.join(mode_aliases)}")
+        chosen = ask_choice("Scenario/mode", list(mode_aliases), default_mode)
+        mode, implied_duration = mode_aliases[chosen]
+
+        allowed_durations = [72, 120] if mode == "fluvial" else [1, 3, 6]
+        duration_default = DURATION_HOURS_OVERRIDE if DURATION_HOURS_OVERRIDE is not None else implied_duration
+        if duration_default not in allowed_durations:
+            raise ValueError(f"Duration override {duration_default!r} is invalid for {chosen}; choose {allowed_durations}.")
+        DURATION_HOURS = int(ask_choice("Duration in hours", allowed_durations, duration_default))
+        CHANNELMV = ({1: 100, 3: 300, 6: 900}[DURATION_HOURS] if mode == "flash" else None)
+
+        while True:
+            raw = input(f"Resolution (low/medium/high/veryhigh or 1m, 2m, 5m, 10m, 20m, 40m, 80m, 150m, 300m) [{DEFAULT_RESOLUTION}]: ").strip().lower() or DEFAULT_RESOLUTION
+            if raw in RESOLUTION_PRESETS:
+                RESOLUTION = RESOLUTION_PRESETS[raw]
+                break
+            if raw in VALID_RESOLUTIONS:
+                RESOLUTION = raw
+                break
+            print("Unsupported resolution. Please choose a listed preset or resolution.")
+
+        print("Enter bounding box (supports WGS84 lat/lon degrees or Pseudo-Mercator meters; auto-swaps if inverted).")
+        if BBOX is not None and len(BBOX) == 4:
+            bw, bs, be, bn = BBOX
+            west = ask_float("West / minimum X", bw)
+            south = ask_float("South / minimum Y", bs)
+            east = ask_float("East / maximum X", be)
+            north = ask_float("North / maximum Y", bn)
+        else:
+            west = ask_required_float("West / minimum X")
+            south = ask_required_float("South / minimum Y")
+            east = ask_required_float("East / maximum X")
+            north = ask_required_float("North / maximum Y")
+
+        print("\nOPTIONAL INPUTS (press Enter to accept each default)")
+        MULT_MAN = ask_float("MULT_MAN — Manning/roughness multiplier", DEFAULT_MULT_MAN)
+        MULT_INF = ask_float("MULT_INF — infiltration multiplier", DEFAULT_MULT_INF)
+
+        out_hint = f" [{OUTPUT_ROOT}]" if OUTPUT_ROOT else ""
+        out_raw = input(f"Output folder{out_hint}: ").strip()
+        if out_raw:
+            output_base = Path(out_raw).expanduser()
+        elif OUTPUT_ROOT:
+            output_base = Path(OUTPUT_ROOT).expanduser()
+        else:
+            raise ValueError("Output folder is required.")
+
+        configured_dem = Path(DEM_PATH).expanduser() if (DEM_PATH and str(DEM_PATH).strip().lower() not in ("none", "")) else (Path(DEFAULT_DEM_PATH).expanduser() if DEFAULT_DEM_PATH else None)
+        dem_hint = f" [{configured_dem}]" if configured_dem else " [None - automatic DEM download]"
+        dem_raw = input(f"DEM file path{dem_hint} (Enter uses automatic DEM download): ").strip()
+        if dem_raw:
+            DEM_PATH = Path(dem_raw).expanduser()
+        elif configured_dem:
+            DEM_PATH = configured_dem
+        else:
+            DEM_PATH = None
+
+        KEEP_TILES = ask_choice("Keep tiles and all associated per-tile files?", ["yes", "no"], DEFAULT_KEEP_TILES) == "yes"
+        API_KEY = input(f"API key [{DEFAULT_API_KEY}]: ").strip() or DEFAULT_API_KEY
+
+    # Validate FastFlood executable and DEM file (if provided)
+    resolved_exe = resolve_fastflood_exe()
+    if not (resolved_exe.is_file() or shutil.which(str(FASTFLOOD_EXE)) or shutil.which("fastflood.exe")):
+        raise FileNotFoundError(f"FastFlood executable not found: {FASTFLOOD_EXE}. Edit FASTFLOOD_EXE in advanced settings or add it to PATH.")
+    FASTFLOOD_EXE = resolved_exe
+    if DEM_PATH is not None and not DEM_PATH.is_file():
+        raise FileNotFoundError(f"DEM not found: {DEM_PATH}")
+
+    # Inspect DEM CRS (or default to EPSG:3857) and normalize/convert bounding box
+    if DEM_PATH is not None:
+        with rasterio.open(DEM_PATH) as src:
+            if src.count < 1:
+                raise ValueError("DEM has no bands.")
+            dem_crs = src.crs
+            if dem_crs is None:
+                raise ValueError(f"DEM at {DEM_PATH} has no coordinate reference system (CRS) defined.")
+            if EXPECTED_DEM_CRS and str(EXPECTED_DEM_CRS).strip().lower() not in ("none", ""):
+                try:
+                    expected_crs = rasterio.crs.CRS.from_string(EXPECTED_DEM_CRS)
+                    if dem_crs != expected_crs:
+                        print(f"Notice: DEM CRS is {dem_crs} (EXPECTED_DEM_CRS is {EXPECTED_DEM_CRS}). Using DEM CRS {dem_crs}.")
+                except Exception:
+                    pass
+
+            px = abs(src.transform.a)
+            RESOLUTION = get_dem_resolution_str(px)
+            print(f"DEM provided ({DEM_PATH.name}): pixel size ~{px:.2f}m. Using model resolution {RESOLUTION} with raw DEM data.")
+
+            swapped_input, dem_bbox = normalize_and_convert_bbox((west, south, east, north), dem_crs, src.bounds)
+            BBOX = dem_bbox
+            in_w, in_s, in_e, in_n = swapped_input
+            tiles = build_tiles(src)
+    else:
+        dem_crs = rasterio.crs.CRS.from_epsg(3857)
+        print(f"No DEM provided. FastFlood autohazard will automatically download DEM at indicated resolution {RESOLUTION}.")
+        swapped_input, dem_bbox = normalize_and_convert_bbox((west, south, east, north), dem_crs)
+        BBOX = dem_bbox
+        in_w, in_s, in_e, in_n = swapped_input
+        tiles = build_tiles(None)
 
     mode_tag = {"flash": "flash_only", "hybrid": "hybrid", "fluvial": "fluvial"}[mode]
-    bbox_tag = f"x{west:g}-{east:g}_y{south:g}-{north:g}".replace(".", "p").replace("-", "m")
+    bbox_tag = f"x{in_w:g}-{in_e:g}_y{in_s:g}-{in_n:g}".replace(".", "p").replace("-", "m")
     run_name = f"{mode_tag}_{DURATION_HOURS}h_{RESOLUTION}_man{MULT_MAN:g}_inf{MULT_INF:g}_{bbox_tag}"
-    OUTPUT_ROOT = output_base / run_name
+    OUTPUT_ROOT = output_base if output_base.name == run_name else output_base / run_name
     DEPTH_TILE_NAME = f"depth_{mode_tag}_{DURATION_HOURS}h_{RESOLUTION}.tif"
     DISCHARGE_TILE_NAME = f"discharge_{mode_tag}_{DURATION_HOURS}h_{RESOLUTION}.tif"
 
-    if not FASTFLOOD_EXE.is_file():
-        raise FileNotFoundError(f"FastFlood executable not found: {FASTFLOOD_EXE}. Edit FASTFLOOD_EXE in advanced settings.")
-    if not DEM_PATH.is_file():
-        raise FileNotFoundError(f"DEM not found: {DEM_PATH}")
     if API_KEY == "<KEY>":
         print("WARNING: API key is the <KEY> placeholder. Enter a valid key if required.")
     if PROCESSES < 1:
         raise ValueError("PROCESSES must be at least 1.")
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    with rasterio.open(DEM_PATH) as src:
-        if src.count < 1:
-            raise ValueError("DEM has no bands.")
-        if src.crs != rasterio.crs.CRS.from_string(EXPECTED_DEM_CRS):
-            raise ValueError(f"Expected {EXPECTED_DEM_CRS}, found {src.crs}. Adjust EXPECTED_DEM_CRS if appropriate.")
-        tiles = build_tiles(src)
-        log(f"Mode={mode}; duration={DURATION_HOURS}h; resolution={RESOLUTION}; channelmv={CHANNELMV}; generated {len(tiles)} tiles.")
+    log(f"Mode={mode}; duration={DURATION_HOURS}h; resolution={RESOLUTION}; channelmv={CHANNELMV}; generated {len(tiles)} tiles.")
+    log(f"Input bounding box: {swapped_input}")
+    log(f"Effective bounding box ({dem_crs}): {BBOX}")
+    if DEM_PATH is not None:
+        log(f"DEM path: {DEM_PATH} (raw pixel data passed to FastFlood via -dem)")
+    else:
+        log("DEM: none (FastFlood autohazard will download DEM automatically at indicated resolution)")
+
+    tracker = ProgressTracker(total_tiles=len(tiles), max_workers=PROCESSES)
+    stop_heartbeat = threading.Event()
+
+    def heartbeat_worker():
+        while not stop_heartbeat.wait(LOG_EVERY_SECONDS):
+            msg = tracker.get_heartbeat_message()
+            if msg:
+                log(msg)
+
+    heartbeat_thread = threading.Thread(target=heartbeat_worker, daemon=True)
+    heartbeat_thread.start()
 
     results = []
-    with ThreadPoolExecutor(max_workers=PROCESSES) as pool:
-        futures = {pool.submit(run_tile, t, API_KEY): t for t in tiles}
-        for future in as_completed(futures):
-            t = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                result = {"grid": t.grid, "tile": t.tile_id, "status": "failed",
-                          "message": str(exc), "elapsed_seconds": 0}
-            results.append(result)
-            log(f"{len(results)}/{len(tiles)} {t.grid}/{t.tile_id}: {result['status']} ({result.get('elapsed_seconds', 0)}s)")
+    try:
+        with ThreadPoolExecutor(max_workers=PROCESSES) as pool:
+            futures = {pool.submit(run_tile, t, API_KEY, tracker): t for t in tiles}
+            for future in as_completed(futures):
+                t = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {"grid": t.grid, "tile": t.tile_id, "status": "failed",
+                              "message": str(exc), "elapsed_seconds": 0}
+                results.append(result)
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=1.0)
+
     write_manifest(tiles, results)
     append_timings(results)
     failed = [r for r in results if r["status"] == "failed"]
@@ -741,6 +1124,10 @@ def main():
         mosaic_grid(tiles, "A", a)
         mosaic_grid(tiles, "B", b)
         combine_max(a, b, final)
+        if not KEEP_INTERMEDIATE_GRIDS:
+            a.unlink(missing_ok=True)
+            b.unlink(missing_ok=True)
+            log(f"Removed intermediate grid A and grid B files; retained only final mosaic: {final.name}")
 
     if not KEEP_TILES and not failed:
         import shutil
