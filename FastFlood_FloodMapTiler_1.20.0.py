@@ -97,7 +97,7 @@ DEFAULT_KEEP_TILES = "no"
 
 # Default API-key prompt value. <KEY> is deliberately a placeholder, not a
 # credential; enter a valid key when prompted if your FastFlood setup requires it.
-DEFAULT_API_KEY = "Xx1BfVGbNP76RwYlmQtR8os4halVCpxH"
+DEFAULT_API_KEY = "<KEY>"
 
 # --- Primary run paths and bounding box --------------------------------------
 # Optional full path to an input DEM GeoTIFF covering the simulation area.
