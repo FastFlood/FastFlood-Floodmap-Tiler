@@ -1,5 +1,5 @@
-"""FASTFLOOD USER-FRIENDLY RUNNER
-================================
+"""FASTFLOOD USER-FRIENDLY RUNNER (v1.21)
+=========================================
 
 Purpose
 -------
@@ -32,6 +32,7 @@ Required for every run:
   5. A DEM path, unless DEFAULT_DEM_PATH is configured below.
 
 Optional or defaulted:
+  * Quality option: High (-noautorefine), Medium (-maxlrres 1500, default), or Low (neither).
   * MULT_MAN and MULT_INF calibration multipliers (both default to 1.0).
   * Keep tile folders and per-tile diagnostic files (defaults to No).
   * API key (defaults to the <KEY> placeholder; replace it or enter a key at run time).
@@ -56,6 +57,8 @@ from pathlib import Path
 import numpy as np
 import rasterio
 from rasterio.windows import Window
+
+VERSION = "1.21"
 
 # =============================================================================
 # EASY-TO-FIND RUN SETTINGS — EDIT THESE FIRST
@@ -83,6 +86,12 @@ DURATION_HOURS_OVERRIDE = None
 # RESOLUTION_PRESETS below; literal supported values can also be entered.
 DEFAULT_RESOLUTION = "20m"
 
+# Simulation quality option ("High", "Medium", or "Low", case-insensitive).
+#   High   -> passes "-noautorefine" to the FastFlood CLI
+#   Medium -> passes "-maxlrres 1500" to the FastFlood CLI (default)
+#   Low    -> passes neither of these options to the FastFlood CLI
+DEFAULT_QUALITY = "Medium"
+
 # Default calibration values. The user can accept these or enter different
 # multipliers at the prompts. 1.0 means no scaling relative to the base value.
 DEFAULT_MULT_MAN = 1.0
@@ -97,7 +106,7 @@ DEFAULT_KEEP_TILES = "no"
 
 # Default API-key prompt value. <KEY> is deliberately a placeholder, not a
 # credential; enter a valid key when prompted if your FastFlood setup requires it.
-DEFAULT_API_KEY = "<KEY>"
+DEFAULT_API_KEY = <KEY>
 
 # --- Primary run paths and bounding box --------------------------------------
 # Optional full path to an input DEM GeoTIFF covering the simulation area.
@@ -116,13 +125,13 @@ DEM_PATH = None
 # Coordinates are automatically swapped if west > east or south > north,
 # and automatically converted to the DEM's CRS if needed.
 # Example: BBOX = (5.58, 52.156, 6.08, 52.36)
-BBOX = (5.581681845, 52.367139577, 6.0809759, 52.156432878)
+BBOX = (5.621036183, 50.929835543, 6.077908627, 50.677038416)
 
 # Directory where simulation outputs, tile files, mosaics, and logs will be saved.
 # Can be a parent directory (a parameter-named subfolder will be created inside it)
 # or an explicit directory path (e.g. r"C:\data\flood_output").
 # Example: OUTPUT_ROOT = r"C:\data\flood_output"
-OUTPUT_ROOT = "./output/"
+OUTPUT_ROOT = "./output2/"
 
 # Option to ask for manual input interactively via console prompts.
 # Default: False ("no"), which skips all interactive user prompts and runs directly
@@ -154,7 +163,7 @@ OUTPUT_NODATA = -9999.0
 # --- Tiling and parallel processing -----------------------------------------
 # Approximate width/height of each tile in kilometres. Larger tiles mean fewer
 # FastFlood jobs but more memory per job. Smaller tiles mean more job overhead.
-TILE_SIZE_KM = 50.0
+TILE_SIZE_KM = 25.0
 
 # Fraction of each tile's width/height that overlaps its neighbours. 0.10 means
 # 10% overlap. Overlap provides common coverage for smoother blending.
@@ -223,6 +232,16 @@ RESOLUTION_PRESETS = {"low": "150m", "medium": "80m", "high": "20m", "veryhigh":
 # chosen resolution; this list only validates the input before calling FastFlood.
 VALID_RESOLUTIONS = {"1m", "2m", "5m", "10m", "20m", "40m", "80m", "150m", "300m"}
 
+# Supported quality options and their corresponding FastFlood CLI arguments:
+#   "high"   -> ["-noautorefine"]
+#   "medium" -> ["-maxlrres", "1500"] (default)
+#   "low"    -> []
+QUALITY_OPTIONS = {
+    "high": ["-noautorefine"],
+    "medium": ["-maxlrres", "1500"],
+    "low": [],
+}
+
 # Exact Web Mercator (EPSG:3857) pixel resolutions used internally by FastFlood
 # autohazard / autodem. Derived from Web Mercator circumference (40075016.6856m)
 # divided by (256 * 2^zoom_level). Using these exact pixel sizes prevents horizontal
@@ -264,6 +283,7 @@ DEFAULT_DEM_PATH = None
 # =============================================================================
 SCENARIO = "flashfloodfluvialflood"  # FastFlood scenario identifier; verify for your installation.
 RESOLUTION = DEFAULT_RESOLUTION
+QUALITY = DEFAULT_QUALITY
 DURATION_HOURS = 3
 MULT_INF = DEFAULT_MULT_INF
 MULT_MAN = DEFAULT_MULT_MAN
@@ -447,8 +467,9 @@ def build_command(tile, dem_file, depth_file, discharge_file, api_key):
     """Build one FastFlood invocation; CLI-specific flags live here.
 
     Keep this function as the single place to review CLI syntax. In particular,
-    SCENARIO, RETURN_PERIOD, RESOLUTION, duration, calibration values, CHANNEL_ARGS,
-    and optional CHANNELMV are translated into FastFlood command-line arguments.
+    SCENARIO, RETURN_PERIOD, RESOLUTION, QUALITY, duration, calibration values,
+    CHANNEL_ARGS, and optional CHANNELMV are translated into FastFlood command-line
+    arguments.
     """
     command = [
         str(FASTFLOOD_EXE), "-key", api_key, "-autohazard",
@@ -462,8 +483,12 @@ def build_command(tile, dem_file, depth_file, discharge_file, api_key):
         "-d_lu", "-d_inf",
         "-whout", str(depth_file.resolve()), "-qout", str(discharge_file.resolve()),
         "-dur", str(DURATION_HOURS), "-mult_inf", str(MULT_INF), "-mult_man", str(MULT_MAN),
-        "-noautorefine", "-nochanwh",
+        "-nochanwh",
     ])
+    quality_key = str(QUALITY).strip().lower()
+    if quality_key not in QUALITY_OPTIONS:
+        raise ValueError(f"Unsupported QUALITY {QUALITY!r}; choose High, Medium, or Low.")
+    command.extend(QUALITY_OPTIONS[quality_key])
     if CHANNELMV is not None:
         command.extend(["-channelmv", str(CHANNELMV)])
     return command
@@ -964,7 +989,7 @@ def main():
     Exit codes: 0 = success; 1 = one or more tile failures after processing;
     2 = tile failure prevented mosaic creation under the current safety settings.
     """
-    global DEM_PATH, OUTPUT_ROOT, SCENARIO, RESOLUTION, DURATION_HOURS
+    global DEM_PATH, OUTPUT_ROOT, SCENARIO, RESOLUTION, QUALITY, DURATION_HOURS
     global MULT_INF, MULT_MAN, CHANNELMV, BBOX, KEEP_TILES, API_KEY
     global DEPTH_TILE_NAME, DISCHARGE_TILE_NAME, FASTFLOOD_EXE
 
@@ -982,7 +1007,7 @@ def main():
     manual_input = ASK_FOR_MANUAL_INPUT if isinstance(ASK_FOR_MANUAL_INPUT, bool) else str(ASK_FOR_MANUAL_INPUT).strip().lower() in ("yes", "true", "1", "y")
 
     if not manual_input:
-        print("\nFastFlood — simple flood simulation runner")
+        print(f"\nFastFlood — simple flood simulation runner (v{VERSION})")
         print("Running with configured settings (ASK_FOR_MANUAL_INPUT is False). Skipping user prompts.")
 
         default_mode = RUN_MODE.strip().upper()
@@ -1004,6 +1029,11 @@ def main():
             RESOLUTION = raw_res
         else:
             raise ValueError(f"Unsupported DEFAULT_RESOLUTION {DEFAULT_RESOLUTION!r}.")
+
+        raw_quality = str(DEFAULT_QUALITY).strip().lower()
+        if raw_quality not in QUALITY_OPTIONS:
+            raise ValueError(f"Unsupported DEFAULT_QUALITY {DEFAULT_QUALITY!r}; choose High, Medium, or Low.")
+        QUALITY = raw_quality
 
         if BBOX is None:
             raise ValueError(
@@ -1032,7 +1062,7 @@ def main():
         API_KEY = str(DEFAULT_API_KEY).strip()
 
     else:
-        print("\nFastFlood — simple flood simulation setup")
+        print(f"\nFastFlood — simple flood simulation setup (v{VERSION})")
         print("\nREQUIRED INPUTS")
         print("Bounding box coordinates support WGS84 lat/lon degrees, Pseudo-Mercator meters, or DEM CRS.")
 
@@ -1058,6 +1088,11 @@ def main():
                 RESOLUTION = raw
                 break
             print("Unsupported resolution. Please choose a listed preset or resolution.")
+
+        default_quality = str(DEFAULT_QUALITY).strip().capitalize()
+        if default_quality.lower() not in QUALITY_OPTIONS:
+            default_quality = "Medium"
+        QUALITY = ask_choice("Quality", ["High", "Medium", "Low"], default_quality).lower()
 
         print("Enter bounding box (supports WGS84 lat/lon degrees or Pseudo-Mercator meters; auto-swaps if inverted).")
         if BBOX is not None and len(BBOX) == 4:
@@ -1151,7 +1186,7 @@ def main():
         raise ValueError("PROCESSES must be at least 1.")
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    log(f"Mode={mode}; duration={DURATION_HOURS}h; resolution={RESOLUTION}; channelmv={CHANNELMV}; generated {len(tiles)} tiles.")
+    log(f"Mode={mode}; duration={DURATION_HOURS}h; resolution={RESOLUTION}; quality={QUALITY}; channelmv={CHANNELMV}; generated {len(tiles)} tiles.")
     log(f"Input bounding box: {swapped_input}")
     log(f"Effective bounding box ({dem_crs}): {BBOX}")
     if DEM_PATH is not None:
